@@ -1,8 +1,8 @@
-![demo](demo.gif)
-
 # iphone-linux
 
 Mount your iPhone as a filesystem on Linux over WiFi — no cable, no iTunes, no iCloud.
+
+![demo](demo.gif)
 
 ```bash
 $ ls /mnt/iPhone

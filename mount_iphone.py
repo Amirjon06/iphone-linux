@@ -111,7 +111,7 @@ class IPhoneFS(Operations):
                     return house_arrest.get_afc_service()
                 return AfcService(lockdown)
 
-            self.afc = self.loop.run_until_complete(_setup())
+            self.afc = asyncio.run_coroutine_threadsafe(_setup(), self.loop).result(timeout=30)
             log.info("Reconnect successful.")
             return True
         except Exception as e:

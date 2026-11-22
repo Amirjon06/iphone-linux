@@ -51,6 +51,7 @@ iphone-linux mount [ip]              # Mount iPhone at /mnt/iPhone (auto-discove
 iphone-linux mount-ro                # Mount read-only
 iphone-linux mount-app <bundle-id>   # Mount a single app's sandbox
 iphone-linux watch                   # Auto-mount when iPhone joins WiFi
+iphone-linux apps                      # List installed apps and bundle IDs
 iphone-linux unmount                 # Unmount
 ```
 
@@ -127,7 +128,7 @@ pytest test_iphone_linux.py -v
 - [x] One-command installer
 - [x] Read-only mode (`--ro` flag)
 - [x] Test suite (13 tests, all passing on real hardware)
-- [x] `--app <bundle-id>` flag for per-app sandbox access
+- [x] `mount-app <bundle-id>` for per-app sandbox access
 - [x] Read-ahead cache for large photo libraries
 - [x] Systemd service for auto-mount at boot
 

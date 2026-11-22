@@ -1,4 +1,4 @@
-import os, errno, stat, asyncio, logging, threading, argparse
+import os, errno, stat, asyncio, logging, threading, argparse, time
 from collections import OrderedDict
 from fuse import FUSE, FuseOSError, Operations
 from pymobiledevice3.lockdown import create_using_mobdev2
@@ -11,6 +11,15 @@ log = logging.getLogger('iphonefs')
 CHUNK_SIZE = 1024 * 1024        # 1 MB per cache chunk
 READAHEAD_CHUNKS = 3            # prefetch 3 chunks ahead
 MAX_CACHE_CHUNKS = 64           # ~64 MB max cache
+
+# Exceptions that mean the TCP connection to the phone is dead
+_DEAD_CONN = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    TimeoutError,
+    OSError,          # covers errno.ECONNRESET / EPIPE at the socket level
+)
 
 
 class ReadAheadCache:
@@ -59,24 +68,79 @@ class ReadAheadCache:
                 del self._cache[k]
             self._pending = {p for p in self._pending if p[0] != path}
 
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+            self._pending.clear()
+
 
 class IPhoneFS(Operations):
-    def __init__(self, afc, loop, read_only=False):
+    def __init__(self, afc, loop, host, app=None, read_only=False):
         self.afc = afc
         self.loop = loop
+        self._host = host
+        self._app = app
         self.read_only = read_only
         self._open_files = {}
         self._next_fh = 1
         self._cache = ReadAheadCache()
+        self._reconnect_lock = threading.Lock()
+        self._reconnecting = False
         log.info(f"IPhoneFS initialized (read_only={read_only})")
 
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def _reconnect(self):
+        """Re-establish the AFC connection after the phone woke up."""
+        with self._reconnect_lock:
+            if self._reconnecting:
+                return False
+            self._reconnecting = True
+
+        try:
+            log.info("iPhone connection lost — reconnecting...")
+            self._cache.clear()
+
+            async def _setup():
+                lockdown = await create_using_mobdev2(hostname=self._host)
+                log.info(f"Reconnected! iOS {lockdown.product_version}")
+                if self._app:
+                    house_arrest = HouseArrestService(lockdown, bundle_id=self._app)
+                    return house_arrest.get_afc_service()
+                return AfcService(lockdown)
+
+            self.afc = self.loop.run_until_complete(_setup())
+            log.info("Reconnect successful.")
+            return True
+        except Exception as e:
+            log.warning(f"Reconnect failed: {e}")
+            return False
+        finally:
+            with self._reconnect_lock:
+                self._reconnecting = False
+
     def _run(self, coro):
+        """Run a coroutine on the event loop, auto-reconnecting once on dead connection."""
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return future.result(timeout=30)
+        try:
+            return future.result(timeout=30)
+        except _DEAD_CONN as exc:
+            log.warning(f"Connection error ({type(exc).__name__}), attempting reconnect...")
+            if self._reconnect():
+                raise FuseOSError(errno.ESTALE)
+            raise FuseOSError(errno.EIO)
+        except Exception:
+            raise
 
     def _check_writable(self):
         if self.read_only:
             raise FuseOSError(errno.EROFS)
+
+    # ------------------------------------------------------------------
+    # Read-ahead cache
+    # ------------------------------------------------------------------
 
     def _fetch_chunk(self, path, chunk_idx):
         """Fetch one chunk from AFC and store in cache."""
@@ -110,28 +174,55 @@ class IPhoneFS(Operations):
                 t = threading.Thread(target=self._fetch_chunk, args=(path, chunk_idx), daemon=True)
                 t.start()
 
+    # ------------------------------------------------------------------
+    # FUSE operations
+    # ------------------------------------------------------------------
+
+    def _stat(self, path):
+        info = self._run(self.afc.stat(path))
+        if info['st_ifmt'] == 'S_IFDIR':
+            return dict(st_mode=(stat.S_IFDIR | 0o755), st_nlink=int(info.get('st_nlink', 2)))
+        return dict(st_mode=(stat.S_IFREG | 0o644), st_nlink=1, st_size=int(info.get('st_size', 0)))
+
     def getattr(self, path, fh=None):
-        try:
-            info = self._run(self.afc.stat(path))
-            if info['st_ifmt'] == 'S_IFDIR':
-                return dict(st_mode=(stat.S_IFDIR | 0o755), st_nlink=int(info.get('st_nlink', 2)))
-            else:
-                return dict(st_mode=(stat.S_IFREG | 0o644), st_nlink=1, st_size=int(info.get('st_size', 0)))
-        except Exception:
-            raise FuseOSError(errno.ENOENT)
+        for attempt in range(2):
+            try:
+                return self._stat(path)
+            except FuseOSError as e:
+                if e.errno == errno.ESTALE and attempt == 0:
+                    continue   # reconnected — retry once
+                raise FuseOSError(errno.ENOENT)
+            except Exception:
+                raise FuseOSError(errno.ENOENT)
 
     def readdir(self, path, fh):
-        try:
-            entries = self._run(self.afc.listdir(path))
-            return ['.', '..'] + entries
-        except Exception:
-            raise FuseOSError(errno.ENOENT)
+        for attempt in range(2):
+            try:
+                entries = self._run(self.afc.listdir(path))
+                return ['.', '..'] + entries
+            except FuseOSError as e:
+                if e.errno == errno.ESTALE and attempt == 0:
+                    continue
+                raise FuseOSError(errno.ENOENT)
+            except Exception:
+                raise FuseOSError(errno.ENOENT)
 
     def open(self, path, flags):
         import os as _os
         writable = bool(flags & (_os.O_WRONLY | _os.O_RDWR))
         if writable and self.read_only:
             raise FuseOSError(errno.EROFS)
+        # Probe connection; if dead, reconnect before returning handle
+        for attempt in range(2):
+            try:
+                self._run(self.afc.stat(path))
+                break
+            except FuseOSError as e:
+                if e.errno == errno.ESTALE and attempt == 0:
+                    continue
+                raise FuseOSError(errno.EIO)
+            except Exception:
+                raise FuseOSError(errno.EIO)
         fh = self._next_fh
         self._next_fh += 1
         self._open_files[fh] = {'path': path, 'buf': None, 'writable': writable}
@@ -142,14 +233,11 @@ class IPhoneFS(Operations):
             chunk_idx = offset // CHUNK_SIZE
             chunk_offset = offset % CHUNK_SIZE
 
-            # Ensure this chunk is cached
             if self._cache.get(path, chunk_idx) is None:
                 self._fetch_chunk(path, chunk_idx)
 
-            # Kick off prefetch for upcoming chunks
             self._prefetch(path, chunk_idx)
 
-            # Assemble result from cache chunks
             result = bytearray()
             remaining = size
             cur_chunk = chunk_idx
@@ -320,7 +408,9 @@ def main():
     mode = 'read-only' if args.ro else 'read-write'
     target = f"app:{args.app}" if args.app else 'iPhone'
     log.info(f"Mounting {target} at {args.mountpoint} ({mode})")
-    FUSE(IPhoneFS(afc, loop, read_only=args.ro), args.mountpoint, nothreads=True, foreground=True, allow_other=True)
+    FUSE(IPhoneFS(afc, loop, host=args.host, app=args.app, read_only=args.ro),
+         args.mountpoint, nothreads=True, foreground=True, allow_other=True)
+
 
 if __name__ == '__main__':
     main()

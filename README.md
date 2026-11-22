@@ -2,19 +2,6 @@
 
 Mount your iPhone as a filesystem on Linux over WiFi — no cable, no iTunes, no iCloud.
 
-```bash
-$ ls /mnt/iPhone
-Books  DCIM  Downloads  Music  PhotoData  Recordings  iTunes_Control
-
-$ cp /mnt/iPhone/DCIM/100APPLE/IMG_0048.JPEG ~/photos/
-
-$ echo "hello from linux" > /mnt/iPhone/Downloads/note.txt
-
-$ iphone-linux mount-app com.apple.Pages
-$ ls /mnt/iPhone-Pages
-Documents  Library  tmp
-```
-
 ## Why
 
 Linux users who want to pull photos off their iPhone have two bad options:
@@ -26,67 +13,58 @@ iphone-linux uses the same WiFi protocol Xcode uses for wireless debugging, comb
 
 ## Install
 
-```bash
-git clone https://github.com/Amirjon06/iphone-linux
-cd iphone-linux
-bash install.sh
-```
+    git clone https://github.com/Amirjon06/iphone-linux
+    cd iphone-linux
+    bash install.sh
 
 The installer creates a Python venv, installs all deps, and adds `iphone-linux` to your PATH.
 
 ### Allow non-root access
 
-By default FUSE mounts are root-only. To let your regular user access the mount:
-
-```bash
-echo "user_allow_other" | sudo tee -a /etc/fuse.conf
-```
-
-This is a one-time setup.
+    echo "user_allow_other" | sudo tee -a /etc/fuse.conf
 
 ## Usage
 
-```bash
-iphone-linux mount [ip]              # Mount iPhone at /mnt/iPhone (auto-discovers IP)
-iphone-linux mount-ro                # Mount read-only
-iphone-linux mount-app <bundle-id>   # Mount a single app's sandbox
-iphone-linux watch                   # Auto-mount when iPhone joins WiFi
-iphone-linux apps [--user]              # List installed apps and bundle IDs
-iphone-linux unmount                 # Unmount
-```
+    iphone-linux mount [ip]                    # Mount iPhone at /mnt/iPhone
+    iphone-linux mount-ro [ip]                 # Mount read-only
+    iphone-linux mount-app <ip> <bundle-id>    # Mount a single app's sandbox
+    iphone-linux watch [mountpoint]            # Auto-mount; reconnects when phone comes back
+    iphone-linux apps [ip] [--user]            # List installed apps and bundle IDs
+    iphone-linux unmount                       # Unmount
 
 ## Per-app sandbox access
 
-iOS sandboxes every app — each one gets its own private Documents folder with no access to other apps. `mount-app` uses Apple's HouseArrest protocol to mount exactly one app's sandbox, so you can read and write its files directly:
+iOS sandboxes every app. `mount-app` uses Apple's HouseArrest protocol to mount exactly one app's sandbox:
 
-```bash
-iphone-linux mount-app com.apple.Pages
-ls /mnt/iPhone-Pages/Documents    # Pages documents
-cp ~/report.pages /mnt/iPhone-Pages/Documents/
+    iphone-linux mount-app 192.168.1.10 com.apple.Pages
+    ls /mnt/iPhone-Pages/Documents
 
-iphone-linux mount-app com.hammerandchisel.discord
-ls /mnt/iPhone-Discord/Library/Caches
-```
+    iphone-linux apps [ip] [--user]  # find bundle IDs
 
-No other Linux tool exposes this. You need the app's bundle ID — find it by searching "bundle id" + the app name, or browsing [VP Browser](https://github.com/nickreoutsos/vpbrowser).
+## Auto-mount (watch mode)
+
+`iphone-linux watch` keeps the mount alive automatically:
+
+- Polls for your iPhone on WiFi using mDNS/Bonjour
+- Mounts the moment it's found
+- If the phone sleeps or leaves the network, unmounts cleanly
+- Waits quietly with exponential backoff (5s → 60s) until the phone returns
+- Remounts automatically when the phone wakes up or rejoins WiFi
+
+## Reliability
+
+The filesystem handles connection drops transparently:
+
+- If the phone sleeps mid-operation, the broken connection is detected
+- The next filesystem access triggers a reconnect automatically
+- If reconnect succeeds, the operation retries — no visible error to the caller
 
 ## Auto-mount at login (systemd)
 
-Install the service so your iPhone mounts automatically whenever you log in and it's on the same WiFi:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/iphone-linux.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now iphone-linux
-```
-
-Check status:
-
-```bash
-systemctl --user status iphone-linux
-journalctl --user -u iphone-linux -f
-```
+    mkdir -p ~/.config/systemd/user
+    cp systemd/iphone-linux.service ~/.config/systemd/user/
+    systemctl --user daemon-reload
+    systemctl --user enable --now iphone-linux
 
 ## First-time setup
 
@@ -97,12 +75,12 @@ journalctl --user -u iphone-linux -f
 
 ## How it works
 
-1. Connects over WiFi via **pymobiledevice3** using the `mobdev2` protocol (same as Xcode wireless debugging)
-2. Discovers your iPhone's IP automatically via mDNS/Bonjour (`_apple-mobdev2._tcp.local.`)
+1. Connects over WiFi via **pymobiledevice3** using the `mobdev2` protocol
+2. Discovers your iPhone's IP automatically via mDNS/Bonjour
 3. Authenticates with a saved pairing record (tap "Trust" once, never again)
 4. Exposes the iPhone filesystem via **AFC** through **FUSE**, or a single app sandbox via **HouseArrest**
-5. asyncio event loop runs in a background thread; FUSE sync callbacks use `run_coroutine_threadsafe()` to submit AFC requests
-6. Read-ahead cache pre-fetches 3 MB ahead in background threads for fast sequential reads
+5. asyncio event loop runs in a background thread; FUSE callbacks use `run_coroutine_threadsafe()`
+6. Read-ahead cache pre-fetches 3 MB ahead in background threads
 
 ## Requirements
 
@@ -113,10 +91,7 @@ journalctl --user -u iphone-linux -f
 
 ## Tests
 
-```bash
-# Mount first, then:
-pytest test_iphone_linux.py -v
-```
+    pytest test_iphone_linux.py -v
 
 13 tests covering mount sanity, read, offset read, JPEG header validation, write, binary write, 1 MB write, overwrite, mkdir, rmdir, unlink, and rename — all run against a real iPhone over WiFi.
 
@@ -128,20 +103,20 @@ pytest test_iphone_linux.py -v
 - [x] One-command installer
 - [x] Read-only mode (`--ro` flag)
 - [x] Test suite (13 tests, all passing on real hardware)
-- [x] `mount-app <bundle-id>` for per-app sandbox access
+- [x] `mount-app <ip> <bundle-id>` for per-app sandbox access
 - [x] Read-ahead cache for large photo libraries
 - [x] Systemd service for auto-mount at boot
+- [x] Graceful reconnect on sleep — auto-retries on next access
+- [x] Watch mode with exponential backoff — quiet polling, instant remount
 
 ## Performance
 
 Read-ahead cache pre-fetches 3 chunks (3 MB) ahead in background threads. Measured on a real iPhone over WiFi:
 
-```
-First copy (cold):   0.325s   (260 KB JPEG)
-Second copy (warm):  0.199s   39% faster
-```
+    First copy (cold):   0.325s   (260 KB JPEG)
+    Second copy (warm):  0.199s   39% faster
 
-Sequential reads — large photo libraries, video files — benefit most. Random reads and small files are unaffected.
+Sequential reads — large photo libraries, video files — benefit most.
 
 ## Stack
 

@@ -1,0 +1,13 @@
+[Unit]
+Description=iPhone Linux auto-mount
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/%u/.local/bin/iphone-linux watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

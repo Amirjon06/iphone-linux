@@ -33,6 +33,9 @@ class ReadAheadCache:
     def put(self, path, chunk_idx, data):
         key = self._chunk_key(path, chunk_idx)
         with self._lock:
+            # Drop stale prefetch result if invalidated while fetch was in-flight
+            if key not in self._pending:
+                return
             self._cache[key] = data
             self._cache.move_to_end(key)
             if len(self._cache) > MAX_CACHE_CHUNKS:
@@ -85,9 +88,12 @@ class IPhoneFS(Operations):
         offset = chunk_idx * CHUNK_SIZE
         try:
             async def _read():
-                async with self.afc.open(path, mode='r') as f:
-                    await f.seek(offset)
-                    return await f.read(CHUNK_SIZE)
+                handle = await self.afc.fopen(path, 'r')
+                try:
+                    await self.afc.fseek(handle, offset, 0)
+                    return await self.afc.fread(handle, CHUNK_SIZE)
+                finally:
+                    await self.afc.fclose(handle)
             future = asyncio.run_coroutine_threadsafe(_read(), self.loop)
             data = future.result(timeout=30)
             self._cache.put(path, chunk_idx, data)
@@ -181,9 +187,14 @@ class IPhoneFS(Operations):
 
     async def _write_chunked(self, path, data):
         WRITE_CHUNK = 1024 * 1024  # 1 MB
-        async with self.afc.open(path, mode='w') as f:
+        import sys; print(f"[DEBUG] _write_chunked called: {path} len={len(data)}", flush=True, file=sys.stderr)
+        handle = await self.afc.fopen(path, 'w')
+        try:
             for i in range(0, len(data), WRITE_CHUNK):
-                await f.write(data[i:i + WRITE_CHUNK])
+                await self.afc.fwrite(handle, data[i:i + WRITE_CHUNK])
+        finally:
+            await self.afc.fclose(handle)
+        self._cache.invalidate(path)
 
     def flush(self, path, fh):
         if fh not in self._open_files:

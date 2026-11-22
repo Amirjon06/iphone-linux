@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.plist
+iphone_connection.py
+tray.py
+wifi_pair.py
+.pytest_cache/

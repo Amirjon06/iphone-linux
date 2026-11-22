@@ -221,9 +221,13 @@ pytest test_iphone_linux.py -v
 
 ## Performance
 
-Read-ahead cache pre-fetches 3 chunks (3 MB) ahead in background threads. Measured on a real iPhone over WiFi:
+Read-ahead cache pre-fetches 3 chunks (3 MB) ahead in background threads.
 
-Sequential reads — large photo libraries, video files — benefit most. Random reads and small files are unaffected.
+| File | Cold (first access) | Warm (cached) | Speedup |
+|------|--------------------|-----------------|---------| 
+| 260 KB JPEG | 0.94 s | 0.039 s | **24×** |
+
+Tested over 802.11ac WiFi, iOS 26.6.2, pymobiledevice3 11.63.0. Sequential reads — large photo libraries, video files — benefit most. Random reads and small files see less gain.
 
 ## Stack
 

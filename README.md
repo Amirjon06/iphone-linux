@@ -1,3 +1,5 @@
+# iphone-linux
+
 Mount your iPhone as a filesystem on Linux over WiFi — no cable, no iTunes, no iCloud.
 
 ```bash
@@ -67,6 +69,24 @@ ls /mnt/iPhone-Discord/Library/Caches
 
 No other Linux tool exposes this. You need the app's bundle ID — find it by searching "bundle id" + the app name, or browsing [VP Browser](https://github.com/nickreoutsos/vpbrowser).
 
+## Auto-mount at login (systemd)
+
+Install the service so your iPhone mounts automatically whenever you log in and it's on the same WiFi:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/iphone-linux.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now iphone-linux
+```
+
+Check status:
+
+```bash
+systemctl --user status iphone-linux
+journalctl --user -u iphone-linux -f
+```
+
 ## First-time setup
 
 1. iPhone: **Settings → Privacy & Security → Developer Mode → Enable**
@@ -81,7 +101,7 @@ No other Linux tool exposes this. You need the app's bundle ID — find it by se
 3. Authenticates with a saved pairing record (tap "Trust" once, never again)
 4. Exposes the iPhone filesystem via **AFC** through **FUSE**, or a single app sandbox via **HouseArrest**
 5. asyncio event loop runs in a background thread; FUSE sync callbacks use `run_coroutine_threadsafe()` to submit AFC requests
-6. Reads use AFC file handles with seek() for efficient offset-based I/O — no full-file downloads
+6. Read-ahead cache pre-fetches 3 MB ahead in background threads for fast sequential reads
 
 ## Requirements
 
@@ -118,22 +138,3 @@ pymobiledevice3 · fusepy · libfuse2t64 · zeroconf · Python 3
 ## License
 
 MIT
-
-## Auto-mount at login (systemd)
-
-Install the service so your iPhone mounts automatically whenever you log in and it's on the same WiFi:
-
-```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/iphone-linux.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now iphone-linux
-```
-
-Check status:
-
-```bash
-systemctl --user status iphone-linux
-journalctl --user -u iphone-linux -f
-```
-

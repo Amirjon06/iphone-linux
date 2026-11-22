@@ -177,7 +177,8 @@ class IPhoneFS(Operations):
     def release(self, path, fh):
         if fh in self._open_files:
             entry = self._open_files[fh]
-            if entry['writable'] and entry['buf'] is not None:
+            # flush() already wrote; release() only writes if flush() was never called
+            if entry['writable'] and entry['buf'] is not None and not entry.get('flushed'):
                 try:
                     self._run(self._write_chunked(path, bytes(entry['buf'])))
                 except Exception:
@@ -187,7 +188,6 @@ class IPhoneFS(Operations):
 
     async def _write_chunked(self, path, data):
         WRITE_CHUNK = 1024 * 1024  # 1 MB
-        import sys; print(f"[DEBUG] _write_chunked called: {path} len={len(data)}", flush=True, file=sys.stderr)
         handle = await self.afc.fopen(path, 'w')
         try:
             for i in range(0, len(data), WRITE_CHUNK):
@@ -204,6 +204,7 @@ class IPhoneFS(Operations):
             return 0
         try:
             self._run(self._write_chunked(path, bytes(entry['buf'])))
+            entry['flushed'] = True
         except Exception:
             raise FuseOSError(errno.EIO)
         return 0

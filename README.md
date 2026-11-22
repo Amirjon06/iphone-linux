@@ -240,6 +240,7 @@ pytest test_iphone_linux.py -v
 - [x] Systemd service for auto-mount at boot
 - [x] Graceful reconnect on sleep — auto-retries on next access
 - [x] Watch mode with exponential backoff — quiet polling, instant remount
+- [ ] Resumable transfers — resume large file copies after connection drop mid-transfer
 
 ## Performance
 

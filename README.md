@@ -51,7 +51,7 @@ iphone-linux mount [ip]              # Mount iPhone at /mnt/iPhone (auto-discove
 iphone-linux mount-ro                # Mount read-only
 iphone-linux mount-app <bundle-id>   # Mount a single app's sandbox
 iphone-linux watch                   # Auto-mount when iPhone joins WiFi
-iphone-linux apps                      # List installed apps and bundle IDs
+iphone-linux apps [--user]              # List installed apps and bundle IDs
 iphone-linux unmount                 # Unmount
 ```
 

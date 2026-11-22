@@ -39,7 +39,7 @@ iphone-linux uses the same WiFi protocol Xcode uses for wireless debugging, comb
 
 - Linux (Ubuntu 24.04+ tested)
 - Python 3.10+
-- iPhone with Developer Mode enabled
+- iPhone with Developer Mode enabled (free, no Apple Developer account needed)
 - Same WiFi network as your Linux machine
 
 ## Install

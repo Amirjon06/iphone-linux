@@ -108,7 +108,7 @@ pytest test_iphone_linux.py -v
 - [x] Read-only mode (`--ro` flag)
 - [x] Test suite (13 tests, all passing on real hardware)
 - [x] `--app <bundle-id>` flag for per-app sandbox access
-- [ ] Read-ahead cache for large photo libraries
+- [x] Read-ahead cache for large photo libraries
 - [x] Systemd service for auto-mount at boot
 
 ## Stack

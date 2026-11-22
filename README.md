@@ -109,7 +109,7 @@ pytest test_iphone_linux.py -v
 - [x] Test suite (13 tests, all passing on real hardware)
 - [x] `--app <bundle-id>` flag for per-app sandbox access
 - [ ] Read-ahead cache for large photo libraries
-- [ ] Systemd service for auto-mount at boot
+- [x] Systemd service for auto-mount at boot
 
 ## Stack
 
@@ -118,3 +118,22 @@ pymobiledevice3 · fusepy · libfuse2t64 · zeroconf · Python 3
 ## License
 
 MIT
+
+## Auto-mount at login (systemd)
+
+Install the service so your iPhone mounts automatically whenever you log in and it's on the same WiFi:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/iphone-linux.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now iphone-linux
+```
+
+Check status:
+
+```bash
+systemctl --user status iphone-linux
+journalctl --user -u iphone-linux -f
+```
+

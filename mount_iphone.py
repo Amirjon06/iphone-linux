@@ -98,7 +98,9 @@ class IPhoneFS(Operations):
             data = future.result(timeout=30)
             self._cache.put(path, chunk_idx, data)
         except Exception:
-            self._cache.put(path, chunk_idx, b'')
+            # Don't cache error result — clear pending so next read retries from device
+            with self._cache._lock:
+                self._cache._pending.discard((path, chunk_idx))
 
     def _prefetch(self, path, start_chunk):
         """Kick off background prefetch for upcoming chunks."""

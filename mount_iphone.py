@@ -1,4 +1,4 @@
-import os, errno, stat, asyncio, logging, threading, argparse, time
+import os, errno, stat, asyncio, logging, threading, argparse, time, sqlite3
 from collections import OrderedDict
 from fuse import FUSE, FuseOSError, Operations
 from pymobiledevice3.lockdown import create_using_mobdev2
@@ -71,8 +71,146 @@ class ReadAheadCache:
     def clear(self):
         with self._lock:
             self._cache.clear()
+            self._meta.invalidate_all()
             self._pending.clear()
 
+
+
+METADATA_TTL = 30
+NEGATIVE_TTL = 10
+DB_PATH = '/tmp/iphone_meta.db'
+
+class MetaCache:
+    def __init__(self, db_path=DB_PATH):
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute('''CREATE TABLE IF NOT EXISTS meta (
+            path TEXT PRIMARY KEY,
+            st_mode INTEGER,
+            st_nlink INTEGER,
+            st_size INTEGER,
+            negative INTEGER DEFAULT 0,
+            expires REAL
+        )''')
+        self._conn.execute('''CREATE TABLE IF NOT EXISTS dirents (
+            parent TEXT,
+            name TEXT,
+            expires REAL,
+            PRIMARY KEY (parent, name)
+        )''')
+        self._conn.commit()
+
+    def get_stat(self, path):
+        with self._lock:
+            row = self._conn.execute(
+                'SELECT st_mode,st_nlink,st_size,negative,expires FROM meta WHERE path=?',
+                (path,)
+            ).fetchone()
+        if not row:
+            return None, None
+        st_mode, st_nlink, st_size, negative, expires = row
+        if time.time() > expires:
+            self.invalidate(path)
+            return None, None
+        if negative:
+            return None, True
+        return dict(st_mode=st_mode, st_nlink=st_nlink, st_size=st_size), False
+
+    def put_stat(self, path, stat_dict):
+        expires = time.time() + METADATA_TTL
+        with self._lock:
+            self._conn.execute('''INSERT OR REPLACE INTO meta
+                (path,st_mode,st_nlink,st_size,negative,expires)
+                VALUES (?,?,?,?,0,?)''',
+                (path, stat_dict['st_mode'], stat_dict.get('st_nlink',1),
+                 stat_dict.get('st_size',0), expires))
+            self._conn.commit()
+
+    def put_negative(self, path):
+        expires = time.time() + NEGATIVE_TTL
+        with self._lock:
+            self._conn.execute('''INSERT OR REPLACE INTO meta
+                (path,st_mode,st_nlink,st_size,negative,expires)
+                VALUES (?,0,0,0,1,?)''', (path, expires))
+            self._conn.commit()
+
+    def get_dir(self, path):
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT name,expires FROM dirents WHERE parent=?', (path,)
+            ).fetchall()
+        if not rows:
+            return None
+        now = time.time()
+        if any(r[1] < now for r in rows):
+            self.invalidate_dir(path)
+            return None
+        return [r[0] for r in rows]
+
+    def put_dir(self, path, entries):
+        expires = time.time() + METADATA_TTL
+        with self._lock:
+            self._conn.execute('DELETE FROM dirents WHERE parent=?', (path,))
+            self._conn.executemany(
+                'INSERT INTO dirents (parent,name,expires) VALUES (?,?,?)',
+                [(path, e, expires) for e in entries]
+            )
+            self._conn.commit()
+
+    def invalidate(self, path):
+        with self._lock:
+            self._conn.execute('DELETE FROM meta WHERE path=?', (path,))
+            self._conn.commit()
+
+    def invalidate_dir(self, path):
+        with self._lock:
+            self._conn.execute('DELETE FROM dirents WHERE parent=?', (path,))
+            self._conn.commit()
+
+    def invalidate_all(self):
+        with self._lock:
+            self._conn.execute('DELETE FROM meta')
+            self._conn.execute('DELETE FROM dirents')
+            self._conn.commit()
+
+
+RESUME_DIR = '/tmp/iphone_resume'
+
+def _resume_key(path):
+    import hashlib
+    return hashlib.md5(path.encode()).hexdigest()
+
+def _resume_path(path):
+    os.makedirs(RESUME_DIR, exist_ok=True)
+    return os.path.join(RESUME_DIR, _resume_key(path) + '.bin')
+
+def _resume_save(path, buf):
+    try:
+        rp = _resume_path(path)
+        with open(rp, 'wb') as f:
+            f.write(bytes(buf))
+    except Exception:
+        pass
+
+def _resume_load(path):
+    try:
+        rp = _resume_path(path)
+        if os.path.exists(rp):
+            with open(rp, 'rb') as f:
+                data = f.read()
+            logging.getLogger("iphone-fs").info(f"[resume] resuming {path} from {len(data)} bytes")
+            return bytearray(data)
+    except Exception:
+        pass
+    return None
+
+def _resume_clear(path):
+    try:
+        rp = _resume_path(path)
+        if os.path.exists(rp):
+            os.remove(rp)
+    except Exception:
+        pass
 
 class IPhoneFS(Operations):
     def __init__(self, afc, loop, host, app=None, read_only=False):
@@ -84,6 +222,7 @@ class IPhoneFS(Operations):
         self._open_files = {}
         self._next_fh = 1
         self._cache = ReadAheadCache()
+        self._meta = MetaCache()
         self._reconnect_lock = threading.Lock()
         self._reconnecting = False
         log.info(f"IPhoneFS initialized (read_only={read_only})")
@@ -102,6 +241,7 @@ class IPhoneFS(Operations):
         try:
             log.info("iPhone connection lost — reconnecting...")
             self._cache.clear()
+            self._meta.invalidate_all()
 
             async def _setup():
                 lockdown = await create_using_mobdev2(hostname=self._host)
@@ -111,7 +251,8 @@ class IPhoneFS(Operations):
                     return house_arrest.get_afc_service()
                 return AfcService(lockdown)
 
-            self.afc = asyncio.run_coroutine_threadsafe(_setup(), self.loop).result(timeout=30)
+            future = asyncio.run_coroutine_threadsafe(_setup(), self.loop)
+            self.afc = future.result(timeout=30)
             log.info("Reconnect successful.")
             return True
         except Exception as e:
@@ -185,20 +326,33 @@ class IPhoneFS(Operations):
         return dict(st_mode=(stat.S_IFREG | 0o644), st_nlink=1, st_size=int(info.get('st_size', 0)))
 
     def getattr(self, path, fh=None):
+        cached, negative = self._meta.get_stat(path)
+        if negative:
+            raise FuseOSError(errno.ENOENT)
+        if cached is not None:
+            return cached
         for attempt in range(2):
             try:
-                return self._stat(path)
+                result = self._stat(path)
+                self._meta.put_stat(path, result)
+                return result
             except FuseOSError as e:
                 if e.errno == errno.ESTALE and attempt == 0:
-                    continue   # reconnected — retry once
+                    continue
+                self._meta.put_negative(path)
                 raise FuseOSError(errno.ENOENT)
             except Exception:
+                self._meta.put_negative(path)
                 raise FuseOSError(errno.ENOENT)
 
     def readdir(self, path, fh):
+        cached = self._meta.get_dir(path)
+        if cached is not None:
+            return ['.', '..'] + cached
         for attempt in range(2):
             try:
                 entries = self._run(self.afc.listdir(path))
+                self._meta.put_dir(path, entries)
                 return ['.', '..'] + entries
             except FuseOSError as e:
                 if e.errno == errno.ESTALE and attempt == 0:
@@ -271,8 +425,11 @@ class IPhoneFS(Operations):
             if entry['writable'] and entry['buf'] is not None and not entry.get('flushed'):
                 try:
                     self._run(self._write_chunked(path, bytes(entry['buf'])))
+                    _resume_clear(path)
                 except Exception:
                     pass
+            elif entry.get('flushed'):
+                _resume_clear(path)
             del self._open_files[fh]
         return 0
 
@@ -302,13 +459,15 @@ class IPhoneFS(Operations):
     def create(self, path, mode):
         self._check_writable()
         self._cache.invalidate(path)
+        self._meta.invalidate(path)
         try:
             self._run(self.afc.set_file_contents(path, b''))
         except Exception:
             raise FuseOSError(errno.EIO)
         fh = self._next_fh
         self._next_fh += 1
-        self._open_files[fh] = {'path': path, 'buf': bytearray(), 'writable': True}
+        resume_buf = _resume_load(path)
+        self._open_files[fh] = {'path': path, 'buf': resume_buf if resume_buf is not None else bytearray(), 'writable': True}
         return fh
 
     def write(self, path, data, offset, fh):
@@ -326,6 +485,7 @@ class IPhoneFS(Operations):
             buf.extend(b'\x00' * (offset + len(data) - len(buf)))
         buf[offset:offset + len(data)] = data
         self._cache.invalidate(path)
+        _resume_save(path, buf)
         return len(data)
 
     def truncate(self, path, length, fh=None):
@@ -358,6 +518,7 @@ class IPhoneFS(Operations):
     def unlink(self, path):
         self._check_writable()
         self._cache.invalidate(path)
+        self._meta.invalidate(path)
         try:
             self._run(self.afc.rm(path))
         except Exception:
@@ -367,6 +528,8 @@ class IPhoneFS(Operations):
         self._check_writable()
         self._cache.invalidate(old)
         self._cache.invalidate(new)
+        self._meta.invalidate(old)
+        self._meta.invalidate(new)
         try:
             self._run(self.afc.rename(old, new))
         except Exception:

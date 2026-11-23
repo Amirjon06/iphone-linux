@@ -242,7 +242,7 @@ pytest test_iphone_linux.py -v
 - [x] Watch mode with exponential backoff — quiet polling, instant remount
 - [ ] Resumable transfers — resume large file copies after connection drop mid-transfer
 - [ ] SQLite metadata cache — instant directory listings for large photo libraries (target: 4s → <50ms)
-- [ ] Auto-sync daemon — quietly copy new photos to ~/Pictures when iPhone joins home WiFi
+- [x] Auto-sync daemon — quietly copy new photos to ~/Pictures when iPhone joins home WiFi
 
 ## Performance
 

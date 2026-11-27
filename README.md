@@ -242,19 +242,13 @@ pytest test_iphone_linux.py -v
 - [x] Systemd service for auto-mount at boot
 - [x] Graceful reconnect on sleep — auto-retries on next access
 - [x] Watch mode with exponential backoff — quiet polling, instant remount
-- [x] Resumable transfers — resume large file copies after connection drop mid-transfer
-- [x] SQLite metadata cache — instant directory listings for large photo libraries (target: 4s → <50ms)
-- [x] Auto-sync daemon — quietly copy new photos to ~/Pictures when iPhone joins home WiFi
+- [x] Resumable transfers — retries automatically after connection drop
+- [ ] SQLite metadata cache — instant directory listings for large libraries (planned)
+- [ ] Auto-sync daemon — quietly copy new photos to ~/Pictures when iPhone joins WiFi (planned)
 
 ## Performance
 
-Read-ahead cache pre-fetches 3 chunks (3 MB) ahead in background threads.
-
-| File | Cold (first access) | Warm (cached) | Speedup |
-|------|--------------------|-----------------|---------| 
-| 260 KB JPEG | 0.94 s | 0.039 s | **24×** |
-
-Tested over 802.11ac WiFi, iOS 26.6.2, pymobiledevice3 11.63.0. Sequential reads — large photo libraries, video files — benefit most. Random reads and small files see less gain.
+Read-ahead cache pre-fetches 3 chunks (3 MB) ahead in background threads for fast sequential reads. Large files (photos, videos) benefit most. Random reads and small files see less gain.
 
 ## Stack
 

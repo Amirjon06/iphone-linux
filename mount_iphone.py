@@ -13,13 +13,25 @@ READAHEAD_CHUNKS = 3            # prefetch 3 chunks ahead
 MAX_CACHE_CHUNKS = 64           # ~64 MB max cache
 
 # Exceptions that mean the TCP connection to the phone is dead
-_DEAD_CONN = (
+try:
+    from pymobiledevice3.exceptions import ConnectionTerminatedError as _ConnTerm
+except ImportError:
+    _ConnTerm = None
+
+_DEAD_CONN = tuple(filter(None, [
     BrokenPipeError,
     ConnectionResetError,
     ConnectionAbortedError,
     TimeoutError,
-    OSError,          # covers errno.ECONNRESET / EPIPE at the socket level
-)
+    OSError,
+    _ConnTerm,
+]))
+
+# AFC errors that are NOT dead connections — let them bubble as filesystem errors
+try:
+    from pymobiledevice3.exceptions import AfcException as _AfcException
+except ImportError:
+    _AfcException = None
 
 
 class ReadAheadCache:
@@ -71,7 +83,6 @@ class ReadAheadCache:
     def clear(self):
         with self._lock:
             self._cache.clear()
-            self._meta.invalidate_all()
             self._pending.clear()
 
 
@@ -246,6 +257,11 @@ class IPhoneFS(Operations):
             async def _setup():
                 lockdown = await create_using_mobdev2(hostname=self._host)
                 log.info(f"Reconnected! iOS {lockdown.product_version}")
+                # iOS 26 drops heartbeat repeatedly — force restart it after each reconnect
+                try:
+                    await lockdown._ensure_heartbeat()
+                except Exception:
+                    pass
                 if self._app:
                     house_arrest = HouseArrestService(lockdown, bundle_id=self._app)
                     return house_arrest.get_afc_service()
@@ -263,16 +279,23 @@ class IPhoneFS(Operations):
                 self._reconnecting = False
 
     def _run(self, coro):
-        """Run a coroutine on the event loop, auto-reconnecting once on dead connection."""
+        """Run a coroutine on the event loop, auto-reconnecting on dead connection."""
         future = asyncio.run_coroutine_threadsafe(coro, self.loop)
         try:
             return future.result(timeout=30)
-        except _DEAD_CONN as exc:
-            log.warning(f"Connection error ({type(exc).__name__}), attempting reconnect...")
-            if self._reconnect():
-                raise FuseOSError(errno.ESTALE)
-            raise FuseOSError(errno.EIO)
-        except Exception:
+        except Exception as exc:
+            # AFC errors (AfcFileNotFoundError etc) inherit OSError — check first
+            # so they never get treated as dead connections
+            if _AfcException and isinstance(exc, _AfcException):
+                raise FuseOSError(errno.EIO)
+            if isinstance(exc, _DEAD_CONN):
+                log.warning(f"Connection error ({type(exc).__name__}), attempting reconnect...")
+                for attempt in range(10):
+                    import time
+                    time.sleep(2)
+                    if self._reconnect():
+                        raise FuseOSError(errno.ESTALE)
+                raise FuseOSError(errno.EIO)
             raise
 
     def _check_writable(self):
@@ -366,6 +389,13 @@ class IPhoneFS(Operations):
         writable = bool(flags & (_os.O_WRONLY | _os.O_RDWR))
         if writable and self.read_only:
             raise FuseOSError(errno.EROFS)
+        # If any entry for this path was recently flushed, invalidate cache so
+        # the next read goes to the phone, not stale prefetch data
+        for entry in self._open_files.values():
+            if entry.get('path') == path and entry.get('flushed'):
+                self._cache.invalidate(path)
+                self._meta.invalidate(path)
+                break
         # Probe connection; if dead, reconnect before returning handle
         for attempt in range(2):
             try:
@@ -401,7 +431,10 @@ class IPhoneFS(Operations):
                 data = self._cache.get(path, cur_chunk)
                 if data is None:
                     self._fetch_chunk(path, cur_chunk)
-                    data = self._cache.get(path, cur_chunk) or b''
+                    data = self._cache.get(path, cur_chunk)
+                    if data is None:
+                        raise IOError('chunk fetch failed')
+                    data = data or b''
                 chunk_data = data[cur_offset:cur_offset + remaining]
                 if not chunk_data:
                     break
@@ -430,18 +463,48 @@ class IPhoneFS(Operations):
                     pass
             elif entry.get('flushed'):
                 _resume_clear(path)
+            if entry.get('writable'):
+                self._cache.invalidate(path)
+                self._meta.invalidate(path)
             del self._open_files[fh]
         return 0
 
     async def _write_chunked(self, path, data):
-        WRITE_CHUNK = 1024 * 1024  # 1 MB
-        handle = await self.afc.fopen(path, 'w')
-        try:
-            for i in range(0, len(data), WRITE_CHUNK):
-                await self.afc.fwrite(handle, data[i:i + WRITE_CHUNK])
-        finally:
-            await self.afc.fclose(handle)
-        self._cache.invalidate(path)
+        MAX_RETRIES = 10
+        RETRY_DELAY = 3   # seconds between retries
+        CHUNK = 512 * 1024  # 512 KB chunks
+
+        attempt = 0
+        while attempt < MAX_RETRIES:
+            bytes_written = 0
+            handle = None
+            try:
+                handle = await self.afc.fopen(path, 'w')
+                while bytes_written < len(data):
+                    chunk = data[bytes_written:bytes_written + CHUNK]
+                    await self.afc.fwrite(handle, chunk)
+                    bytes_written += len(chunk)
+                    _resume_save(path, data[:bytes_written])
+                await self.afc.fclose(handle)
+                handle = None
+                _resume_clear(path)
+                self._cache.invalidate(path)
+                return
+            except Exception as e:
+                if handle is not None:
+                    try:
+                        await self.afc.fclose(handle)
+                    except Exception:
+                        pass
+                _resume_save(path, data[:bytes_written])
+                logging.getLogger('iphonefs').warning(
+                    f'[resume] write interrupted at {bytes_written}/{len(data)} bytes, ' +
+                    f'retrying in {RETRY_DELAY}s (attempt {attempt+1}/{MAX_RETRIES}): {e}'
+                )
+                attempt += 1
+                await asyncio.sleep(RETRY_DELAY)
+
+        raise FuseOSError(errno.EIO)
 
     def flush(self, path, fh):
         if fh not in self._open_files:
@@ -449,10 +512,22 @@ class IPhoneFS(Operations):
         entry = self._open_files[fh]
         if not entry['writable'] or entry['buf'] is None:
             return 0
+        if entry.get('flushed'):
+            return 0
         try:
-            self._run(self._write_chunked(path, bytes(entry['buf'])))
+            data = bytes(entry['buf'])
+            _resume_save(path, data)
+            log.info(f"[flush] writing {len(data)} bytes to {path}")
+            future = asyncio.run_coroutine_threadsafe(
+                self._write_chunked(path, data), self.loop)
+            future.result(timeout=300)
+            _resume_clear(path)
             entry['flushed'] = True
-        except Exception:
+            self._cache.clear()
+            self._meta.invalidate(path)
+            log.info(f"[flush] done writing {path}")
+        except Exception as e:
+            log.error(f"[flush] FAILED: {e}")
             raise FuseOSError(errno.EIO)
         return 0
 
@@ -460,13 +535,17 @@ class IPhoneFS(Operations):
         self._check_writable()
         self._cache.invalidate(path)
         self._meta.invalidate(path)
-        try:
-            self._run(self.afc.set_file_contents(path, b''))
-        except Exception:
-            raise FuseOSError(errno.EIO)
+        resume_buf = _resume_load(path)
+        if resume_buf is None:
+            # No resume — start fresh
+            try:
+                self._run(self.afc.set_file_contents(path, b''))
+            except Exception:
+                raise FuseOSError(errno.EIO)
+        else:
+            log.info(f"[resume] picking up {path} from {len(resume_buf)//1024}KB")
         fh = self._next_fh
         self._next_fh += 1
-        resume_buf = _resume_load(path)
         self._open_files[fh] = {'path': path, 'buf': resume_buf if resume_buf is not None else bytearray(), 'writable': True}
         return fh
 
@@ -491,6 +570,26 @@ class IPhoneFS(Operations):
     def truncate(self, path, length, fh=None):
         self._check_writable()
         self._cache.invalidate(path)
+        # If fh given and open, truncate buffer directly
+        if fh is not None and fh in self._open_files:
+            entry = self._open_files[fh]
+            if entry.get('writable') and entry['buf'] is not None:
+                buf = entry['buf']
+                if length > len(buf):
+                    buf.extend(b'\x00' * (length - len(buf)))
+                else:
+                    del buf[length:]
+                return
+        # Also check by path — cp calls truncate(fh=None) while file is open
+        for _fh, entry in self._open_files.items():
+            if entry.get('path') == path and entry.get('writable') and entry['buf'] is not None:
+                buf = entry['buf']
+                if length > len(buf):
+                    buf.extend(b'\x00' * (length - len(buf)))
+                else:
+                    del buf[length:]
+                return
+        # Only hit the phone if the file is NOT open in memory
         try:
             data = self._run(self.afc.get_file_contents(path))
         except Exception:
@@ -557,6 +656,11 @@ def main():
     async def setup():
         lockdown = await create_using_mobdev2(hostname=args.host)
         log.info(f"Connected! iOS {lockdown.product_version} ({lockdown.udid})")
+        # iOS 26 drops heartbeat immediately after connect — force restart it
+        try:
+            await lockdown._ensure_heartbeat()
+        except Exception:
+            pass
         if args.app:
             log.info(f"Opening app sandbox: {args.app}")
             house_arrest = HouseArrestService(lockdown, bundle_id=args.app)

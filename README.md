@@ -32,7 +32,7 @@ If you just want to grab photos quickly, run `iphone-linux mount` and copy from 
 
 Linux users who want to pull files off their iPhone have two bad options:
 
-- **USB + ifuse** — broken on modern iOS (17+)
+- **USB + ifuse** — broken on iOS 17+, completely non-functional on iOS 26
 - **iCloud web** — slow, requires internet, only exposes some folders
 
 iphone-linux uses the same WiFi protocol Xcode uses for wireless debugging, combined with FUSE, to make your iPhone appear as a normal Linux folder — with full read/write support, no account needed.
@@ -137,6 +137,8 @@ The filesystem handles connection drops transparently:
 - If the phone is off the network, operations return a temporary error until it's back
 
 This means you can lock your phone, walk away, come back, unlock it, and the mount just works again.
+
+Tested on iOS 26.6.2. The iOS 26 heartbeat bug that causes immediate disconnects after every connect is fixed.
 
 ## Auto-Mount at Login (systemd)
 
